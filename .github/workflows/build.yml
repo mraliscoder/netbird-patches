@@ -1,0 +1,142 @@
+# Builds the NetBird client from an upstream release with the patches in
+# patches/ applied, and publishes the binaries as a release of this repository.
+#
+# The daily run picks up new upstream releases on its own. A push that changes
+# the patches or the install script rebuilds the current upstream release, and a
+# manual run can build any tag. When a patch no longer applies the run fails, so
+# GitHub's failure notification is the signal that the patch needs a rebase.
+
+name: Build
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'install.sh'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream NetBird tag to build (empty: latest release)'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  # semver build metadata, so the management server still sees the upstream
+  # version; a pre-release suffix like -routedsrc would sort below it
+  BUILD_META: routedsrc
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      release: ${{ steps.resolve.outputs.release }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$(gh api repos/netbirdio/netbird/releases/latest --jq .tag_name)}"
+          release="${tag}-${BUILD_META}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+          # the schedule only builds what isn't released yet; pushes and manual
+          # runs always rebuild, since the patch or the script may have changed
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && gh release view "$release" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "$release is already released"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64, arm]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: self
+
+      - uses: actions/checkout@v4
+        with:
+          repository: netbirdio/netbird
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: netbird
+
+      - name: Apply the patches
+        working-directory: netbird
+        run: |
+          for p in ../self/patches/*.patch; do
+            echo "Applying $p"
+            git apply --3way "$p"
+          done
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: netbird/go.mod
+          cache-dependency-path: netbird/go.sum
+
+      # vet only the package the patch touches; the full test suite needs root
+      # and a WireGuard device
+      - name: Vet
+        working-directory: netbird
+        run: go vet ./client/internal/routemanager/
+
+      - name: Build
+        working-directory: netbird/client
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          mkdir -p ../../dist
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/netbirdio/netbird/version.version=${TAG#v}+${BUILD_META}" \
+            -o "../../dist/netbird_linux_${GOARCH}" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netbird_linux_${{ matrix.arch }}
+          path: dist/netbird_linux_${{ matrix.arch }}
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE: ${{ needs.resolve.outputs.release }}
+        run: |
+          cp install.sh dist/
+          (cd dist && sha256sum netbird_linux_* > SHA256SUMS)
+
+          if gh release view "$RELEASE" >/dev/null 2>&1; then
+            gh release upload "$RELEASE" dist/* --clobber
+          else
+            gh release create "$RELEASE" dist/* \
+              --title "NetBird $TAG (routed sources)" \
+              --notes "NetBird client [$TAG](https://github.com/netbirdio/netbird/releases/tag/$TAG) with the patches from \`patches/\` at $GITHUB_SHA."
+          fi
