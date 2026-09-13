@@ -1,0 +1,235 @@
+diff --git a/client/internal/acl/manager.go b/client/internal/acl/manager.go
+index 6c544b3..0b5be78 100644
+--- a/client/internal/acl/manager.go
++++ b/client/internal/acl/manager.go
+@@ -155,12 +155,14 @@ func (d *DefaultManager) firewallConfigHash(networkMap *mgmProto.NetworkMap, dns
+ 		RouteRules          []*mgmProto.RouteFirewallRule
+ 		RouteRulesIsEmpty   bool
+ 		DNSRouteFeatureFlag bool
++		RoutedSources       map[string][]string
+ 	}{
+ 		PeerRules:           networkMap.GetFirewallRules(),
+ 		PeerRulesIsEmpty:    networkMap.GetFirewallRulesIsEmpty(),
+ 		RouteRules:          networkMap.GetRoutesFirewallRules(),
+ 		RouteRulesIsEmpty:   networkMap.GetRoutesFirewallRulesIsEmpty(),
+ 		DNSRouteFeatureFlag: dnsRouteFeatureFlag,
++		RoutedSources:       routedSourcesHashKey(routedSourcesByPeer(networkMap)),
+ 	}, hashstructure.FormatV2, &hashstructure.HashOptions{
+ 		ZeroNil:         true,
+ 		IgnoreZeroValue: true,
+@@ -201,6 +203,7 @@ func (d *DefaultManager) applyPeerACLs(networkMap *mgmProto.NetworkMap) error {
+ 	if denyErr != nil {
+ 		return fmt.Errorf("decode deny rule sources: %w", denyErr)
+ 	}
++	expandRoutedSources(groups, routedSourcesByPeer(networkMap))
+ 
+ 	newRulePairs := make(map[id.RuleID][]firewall.Rule)
+ 	var merr *multierror.Error
+diff --git a/client/internal/acl/routed_sources.go b/client/internal/acl/routed_sources.go
+new file mode 100644
+index 0000000..190a7d4
+--- /dev/null
++++ b/client/internal/acl/routed_sources.go
+@@ -0,0 +1,113 @@
++package acl
++
++import (
++	"net/netip"
++	"os"
++	"slices"
++	"strconv"
++
++	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
++)
++
++// envRoutedSources makes hosts behind a routing peer subject to the routing
++// peer's own policies.
++//
++// Stock NetBird only admits peer IPs as sources, so hosts behind a routing peer
++// (for example VPN clients in a pool advertised as a route) can be reached from
++// the mesh but cannot open connections to mesh peers. With this set, every peer
++// rule whose source is a routing peer also matches the prefixes that peer
++// routes: a policy from the routing peer's group to a destination group, with
++// its protocols and ports, then applies to the routed hosts as well.
++const envRoutedSources = "NB_ALLOW_ROUTED_SOURCES"
++
++func routedSourcesEnabled() bool {
++	enabled, _ := strconv.ParseBool(os.Getenv(envRoutedSources))
++	return enabled
++}
++
++// routedSourcesByPeer maps the overlay address of every remote routing peer to
++// the prefixes it routes. It returns nil when the feature is off.
++func routedSourcesByPeer(networkMap *mgmProto.NetworkMap) map[netip.Addr][]netip.Prefix {
++	if !routedSourcesEnabled() || networkMap == nil {
++		return nil
++	}
++
++	peerAddrs := make(map[string][]netip.Addr)
++	peers := slices.Concat(networkMap.GetRemotePeers(), networkMap.GetOfflinePeers())
++	for _, p := range peers {
++		for _, allowed := range p.GetAllowedIps() {
++			prefix, err := netip.ParsePrefix(allowed)
++			if err != nil || !prefix.IsSingleIP() {
++				continue
++			}
++			peerAddrs[p.GetWgPubKey()] = append(peerAddrs[p.GetWgPubKey()], prefix.Addr().Unmap())
++		}
++	}
++
++	routed := make(map[netip.Addr][]netip.Prefix)
++	for _, r := range networkMap.GetRoutes() {
++		// domain routes carry no prefix, and an exit node would make the
++		// routing peer's rules match every source on the internet
++		prefix, err := netip.ParsePrefix(r.GetNetwork())
++		if err != nil || len(r.GetDomains()) > 0 || prefix.Bits() == 0 {
++			continue
++		}
++		prefix = prefix.Masked()
++
++		for _, addr := range peerAddrs[r.GetPeer()] {
++			if !slices.Contains(routed[addr], prefix) {
++				routed[addr] = append(routed[addr], prefix)
++			}
++		}
++	}
++
++	// stable order, so the rule IDs derived from the sources don't change
++	// between identical updates
++	for addr := range routed {
++		slices.SortFunc(routed[addr], func(a, b netip.Prefix) int {
++			if c := a.Addr().Compare(b.Addr()); c != 0 {
++				return c
++			}
++			return a.Bits() - b.Bits()
++		})
++	}
++	return routed
++}
++
++// routedSourcesHashKey renders the mapping in a form the config hash handles.
++func routedSourcesHashKey(routed map[netip.Addr][]netip.Prefix) map[string][]string {
++	if len(routed) == 0 {
++		return nil
++	}
++	out := make(map[string][]string, len(routed))
++	for addr, prefixes := range routed {
++		for _, p := range prefixes {
++			out[addr.String()] = append(out[addr.String()], p.String())
++		}
++	}
++	return out
++}
++
++// expandRoutedSources adds to every group the prefixes routed by the routing
++// peers among its sources, keeping each group within one address family.
++func expandRoutedSources(groups []*peerRuleGroup, routed map[netip.Addr][]netip.Prefix) {
++	if len(routed) == 0 {
++		return
++	}
++
++	for _, g := range groups {
++		var extra []netip.Prefix
++		for _, src := range g.sources {
++			if !src.IsSingleIP() {
++				continue
++			}
++			for _, p := range routed[src.Addr()] {
++				if prefixIsV6(p) != prefixIsV6(src) || slices.Contains(g.sources, p) || slices.Contains(extra, p) {
++					continue
++				}
++				extra = append(extra, p)
++			}
++		}
++		g.sources = append(g.sources, extra...)
++	}
++}
+diff --git a/client/internal/acl/routed_sources_test.go b/client/internal/acl/routed_sources_test.go
+new file mode 100644
+index 0000000..08c965b
+--- /dev/null
++++ b/client/internal/acl/routed_sources_test.go
+@@ -0,0 +1,83 @@
++package acl
++
++import (
++	"net/netip"
++	"testing"
++
++	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
++)
++
++func routedSourcesMap() *mgmProto.NetworkMap {
++	return &mgmProto.NetworkMap{
++		RemotePeers: []*mgmProto.RemotePeerConfig{
++			{WgPubKey: "svpn", AllowedIps: []string{"10.12.45.168/32"}},
++			{WgPubKey: "idp", AllowedIps: []string{"10.12.208.167/32"}},
++		},
++		OfflinePeers: []*mgmProto.RemotePeerConfig{
++			{WgPubKey: "backup", AllowedIps: []string{"10.12.1.1/32"}},
++		},
++		Routes: []*mgmProto.Route{
++			{Peer: "svpn", Network: "10.66.16.0/20"},
++			{Peer: "svpn", Network: "10.66.16.5/20"}, // same prefix, unmasked
++			{Peer: "backup", Network: "10.66.16.0/20"},
++			{Peer: "svpn", Network: "0.0.0.0/0"},
++			{Peer: "svpn", Network: "invalid", Domains: []string{"example.com"}},
++		},
++	}
++}
++
++func TestRoutedSourcesByPeer(t *testing.T) {
++	t.Setenv(envRoutedSources, "true")
++
++	routed := routedSourcesByPeer(routedSourcesMap())
++	pool := netip.MustParsePrefix("10.66.16.0/20")
++
++	for _, peer := range []string{"10.12.45.168", "10.12.1.1"} {
++		got := routed[netip.MustParseAddr(peer)]
++		if len(got) != 1 || got[0] != pool {
++			t.Errorf("routing peer %s: got %v, want [%s]", peer, got, pool)
++		}
++	}
++	if got := routed[netip.MustParseAddr("10.12.208.167")]; got != nil {
++		t.Errorf("peer without routes: got %v", got)
++	}
++}
++
++func TestRoutedSourcesDisabled(t *testing.T) {
++	t.Setenv(envRoutedSources, "")
++
++	if routed := routedSourcesByPeer(routedSourcesMap()); routed != nil {
++		t.Errorf("expected no routed sources when disabled, got %v", routed)
++	}
++}
++
++func TestExpandRoutedSources(t *testing.T) {
++	t.Setenv(envRoutedSources, "true")
++
++	svpn := netip.MustParsePrefix("10.12.45.168/32")
++	other := netip.MustParsePrefix("10.12.99.1/32")
++	groups := []*peerRuleGroup{
++		{sources: []netip.Prefix{svpn, other}},
++		{sources: []netip.Prefix{other}},
++		{sources: []netip.Prefix{netip.MustParsePrefix("fd00::1/128")}},
++	}
++
++	expandRoutedSources(groups, routedSourcesByPeer(routedSourcesMap()))
++
++	pool := netip.MustParsePrefix("10.66.16.0/20")
++	if got := groups[0].sources; len(got) != 3 || got[2] != pool {
++		t.Errorf("group with the routing peer: got %v", got)
++	}
++	if got := groups[1].sources; len(got) != 1 {
++		t.Errorf("group without the routing peer: got %v", got)
++	}
++	if got := groups[2].sources; len(got) != 1 {
++		t.Errorf("IPv6 group: got %v", got)
++	}
++
++	// expanding twice must not duplicate
++	expandRoutedSources(groups, routedSourcesByPeer(routedSourcesMap()))
++	if got := groups[0].sources; len(got) != 3 {
++		t.Errorf("second expansion duplicated sources: got %v", got)
++	}
++}

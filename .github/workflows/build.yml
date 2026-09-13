@@ -89,11 +89,14 @@ jobs:
           go-version-file: netbird/go.mod
           cache-dependency-path: netbird/go.sum
 
-      # vet only the package the patch touches; the full test suite needs root
-      # and a WireGuard device
-      - name: Vet
+      # only the package the patch touches; the full test suite needs root and
+      # a WireGuard device
+      - name: Test
+        if: matrix.arch == 'amd64'
         working-directory: netbird
-        run: go vet ./client/internal/routemanager/
+        run: |
+          go vet ./client/internal/acl/
+          go test ./client/internal/acl/
 
       - name: Build
         working-directory: netbird/client

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Replaces the NetBird client binary on this peer with the patched build and
-# turns on accepting traffic from routed prefixes.
+# turns on applying routing peers' policies to the hosts they route.
 #
 # The peer must already run NetBird installed the usual way; this only swaps
 # the binary and adds the service environment variable.
